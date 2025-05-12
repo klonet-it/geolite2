@@ -1,0 +1,59 @@
+name: Publish GeoLite.mmdb
+
+on:
+  workflow_dispatch:        # Esecuzione manuale
+  schedule:
+    - cron: "0 1 * * *"   # Every Day at  01:00 UTC
+
+jobs:
+  download-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+    - name: Download GeoLite2 databases
+      run: |
+        wget -nv -O- "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN&license_key=${{ secrets.LICENSE_KEY }}&suffix=tar.gz" | tar zxv
+        wget -nv -O- "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=${{ secrets.LICENSE_KEY }}&suffix=tar.gz" | tar zxv
+        wget -nv -O- "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${{ secrets.LICENSE_KEY }}&suffix=tar.gz" | tar zxv
+
+        mkdir -p upload
+        cp -v GeoLite*/*.mmdb upload/
+        echo "TAG_NAME=$(date +'%Y.%m.%d')" >> $GITHUB_ENV
+
+    - name: Push to 'download' branch
+      run: |
+        cd upload
+        git init
+        git config user.name "${{ github.actor }}"
+        git config user.email "${{ github.actor }}@users.noreply.github.com"
+        git checkout -b download
+        git add .
+        git commit -m "${{ env.TAG_NAME }}"
+        git remote add origin "https://${{ github.actor }}:${{ secrets.GHCR_TOKEN }}@github.com/${{ github.repository }}"
+        git push -f origin download
+
+    - name: Create GitHub release
+      uses: softprops/action-gh-release@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      with:
+        tag_name: ${{ env.TAG_NAME }}
+        name: GeoLite2 DBs ${{ env.TAG_NAME }}
+        body: >
+          GeoLite2 ASN, City e Country aggiornati al ${{ env.TAG_NAME }}
+        files: upload/*.mmdb
+
+    - name: Cleanup old releases
+      uses: dev-drprasad/delete-older-releases@master
+      with:
+        keep_latest: 2
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GHCR_TOKEN }}
+
+    - name: Cleanup old workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
