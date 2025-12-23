@@ -11,6 +11,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   download-and-release:
@@ -25,7 +26,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "TAG_NAME=$(date -u +'%Y.%m.%d')" >> "$GITHUB_ENV"
+          echo "TAG_NAME=latest" >> "$GITHUB_ENV"
+          echo "RELEASE_TITLE=GeoLite2 DBs (latest)" >> "$GITHUB_ENV"
+          echo "RELEASE_BODY=GeoLite2 ASN, City e Country (auto-updated). Last run: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
 
       - name: Download GeoLite2 databases
         shell: bash
@@ -44,10 +47,9 @@ jobs:
 
           cp -v GeoLite*/*.mmdb ../upload/
 
-          # fingerprint deterministico dei contenuti
-          (cd ../upload && sha256sum *.mmdb | sort) | sha256sum | awk '{print $1}' > ../upload/.fingerprint
+          (cd ../upload && sha256sum *.mmdb | sort) | sha256sum | awk '{print $1}' > ../upload/fingerprint.sha256
 
-      - name: Check if mmdb changed vs last release
+      - name: Check if mmdb changed vs latest release
         id: changed
         shell: bash
         env:
@@ -58,52 +60,62 @@ jobs:
           REPO="${GITHUB_REPOSITORY}"
           PREV_FP=""
 
-          # Prova a prendere la fingerprint dalla release più recente (se esiste)
-          # Richiede GitHub CLI già presente su ubuntu-latest
-          if gh release view --repo "$REPO" --json assets >/dev/null 2>&1; then
-            ASSET_URL="$(gh release view --repo "$REPO" --json assets \
-              --jq '.assets[] | select(.name==".fingerprint") | .url' || true)"
+          # legge fingerprint dalla release "latest" se esiste
+          if gh release view "${{ env.TAG_NAME }}" --repo "$REPO" --json assets >/dev/null 2>&1; then
+            DL_URL="$(gh release view "${{ env.TAG_NAME }}" --repo "$REPO" --json assets \
+              --jq '.assets[] | select(.name=="fingerprint.sha256") | .browser_download_url' || true)"
 
-            if [ -n "${ASSET_URL:-}" ]; then
-              gh api "${ASSET_URL}" --repo "$REPO" > /tmp/prev_fp.txt
-              PREV_FP="$(cat /tmp/prev_fp.txt | tr -d '\n')"
+            if [ -n "${DL_URL:-}" ]; then
+              curl -fsSL "$DL_URL" -o /tmp/prev_fp.txt
+              PREV_FP="$(tr -d '\n' < /tmp/prev_fp.txt)"
             fi
           fi
 
-          NEW_FP="$(cat upload/.fingerprint | tr -d '\n')"
+          NEW_FP="$(tr -d '\n' < upload/fingerprint.sha256)"
 
           if [ -n "$PREV_FP" ] && [ "$PREV_FP" = "$NEW_FP" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No changes detected (fingerprint identical to last release)."
+            echo "No changes detected (fingerprint identical to latest release)."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "Changes detected."
           fi
 
-      - name: Create GitHub release (only if changed)
+      # Crea o aggiorna sempre la stessa release/tag "latest"
+      - name: Create/update GitHub release (only if changed)
         if: steps.changed.outputs.changed == 'true'
-        uses: softprops/action-gh-release@v2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ env.TAG_NAME }}
-          name: GeoLite2 DBs ${{ env.TAG_NAME }}
-          body: GeoLite2 ASN, City e Country aggiornati al ${{ env.TAG_NAME }}
-          files: |
-            upload/*.mmdb
-            upload/.fingerprint
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          TAG="${{ env.TAG_NAME }}"
 
-      - name: Cleanup old releases
-        if: steps.changed.outputs.changed == 'true'
-        uses: dev-drprasad/delete-older-releases@v0.3.2
-        with:
-          keep_latest: 2
-          delete_tags: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Crea release se non esiste, altrimenti la aggiorna
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG exists, updating notes and assets..."
+            gh release edit "$TAG" --repo "$REPO" \
+              --title "${{ env.RELEASE_TITLE }}" \
+              --notes "${{ env.RELEASE_BODY }}"
+          else
+            echo "Release $TAG does not exist, creating..."
+            gh release create "$TAG" --repo "$REPO" \
+              --title "${{ env.RELEASE_TITLE }}" \
+              --notes "${{ env.RELEASE_BODY }}"
+          fi
 
-      - name: Cleanup old workflow runs
+          # Rimpiazza gli asset (delete + upload)
+          for f in upload/*.mmdb upload/fingerprint.sha256; do
+            name="$(basename "$f")"
+            gh release delete-asset "$TAG" "$name" --repo "$REPO" -y >/dev/null 2>&1 || true
+            gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+          done
+
+      # ✅ cancella run più vecchie di 5 giorni e tiene minimo 2 run
+      - name: Cleanup old workflow runs (older than 5 days)
         uses: Mattraks/delete-workflow-runs@main
         with:
-          retain_days: 0
+          retain_days: 5
           keep_minimum_runs: 2
+
